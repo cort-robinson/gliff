@@ -161,12 +161,29 @@ where
     // The GPU tier imports the captured dmabuf, so it cannot take the wl_shm
     // ring the CPU tier falls back to when no linear dmabuf is offered.
     let allow_shm = !matches!(video, VideoTier::Gpu(_));
+    // The GPU tier samples the frame, so it takes any layout Vulkan imports;
+    // the CPU tier maps it and keeps the linear preference.
+    let import_modifiers = match &video {
+        VideoTier::Gpu(gpu) => Some(
+            [
+                drm_fourcc::DrmFourcc::Xrgb8888,
+                drm_fourcc::DrmFourcc::Argb8888,
+                drm_fourcc::DrmFourcc::Xbgr8888,
+                drm_fourcc::DrmFourcc::Abgr8888,
+            ]
+            .into_iter()
+            .map(|f| (f as u32, gpu.capture_modifiers(f)))
+            .collect(),
+        ),
+        VideoTier::Cpu => None,
+    };
     let capturer = start_capture(
         &cfg.target,
         &output.name,
         &cfg.render_node,
         cfg.capture,
         allow_shm,
+        import_modifiers,
         cap_tx,
     )?;
 
@@ -479,8 +496,12 @@ struct Session {
     cursor_shape_id: u32,
 }
 
-/// The session-wide fps ceiling; ladder levels cap below it.
-const MAX_FPS: u32 = 60;
+/// The session-wide fps ceiling; ladder levels cap below it. Capture is
+/// paced by the output's refresh, so a 60 Hz display still sends at most 60.
+const MAX_FPS: u32 = 120;
+/// Refresh rate of a headless output gliff creates, so it can reach the
+/// ceiling.
+const HEADLESS_HZ: u32 = 120;
 /// Still-picture refinement: at most this many re-encodes of an unchanged
 /// frame, at least this far apart.
 const MAX_REFINES: u8 = 8;
@@ -489,8 +510,9 @@ const REFINE_EVERY: Duration = Duration::from_millis(200);
 /// long the capture is torn down and retried once with full damage.
 const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(700);
 /// The starting ladder level: 30 fps, full quality. It halves the first
-/// burst against level 0 while the controller measures available capacity.
-const START_LEVEL: usize = 1;
+/// burst against the 60 fps level while the controller measures available
+/// capacity.
+const START_LEVEL: usize = 2;
 
 impl Session {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
@@ -644,9 +666,9 @@ impl Session {
             return Ok(());
         }
         tracing::info!(width, height, scale, "resizing headless output");
-        if let Err(e) = self
-            .instance
-            .set_monitor_mode(&self.output.name, width, height, 60, scale)
+        if let Err(e) =
+            self.instance
+                .set_monitor_mode(&self.output.name, width, height, HEADLESS_HZ, scale)
         {
             tracing::warn!(error = %e, "could not resize the headless output");
             return Ok(());
@@ -675,7 +697,7 @@ impl Session {
                 self.output.height = old_h;
                 let s = self.output.scale;
                 self.instance
-                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .set_monitor_mode(&self.output.name, old_w, old_h, HEADLESS_HZ, s)
                     .ok();
                 self.wait_for_mode(old_w, old_h, s).await;
                 self.inject(self.output.logical_extent());
@@ -819,6 +841,16 @@ impl Session {
     /// Encode and queue the pending frame if the link has room and the pace
     /// slot is due, then ask the capture thread for the next one.
     fn pump_encoder(&mut self) -> Result<()> {
+        // Keep one capture request outstanding, even while blocked: a newer
+        // frame replaces `pending` (latest wins), so the frame that finally
+        // goes out on a slow link is current, not as old as the stall. Ask
+        // before encoding, not after: the ring has spare buffers, and the
+        // encode (several ms) let the compositor's next refresh go by, so on
+        // a 100 Hz display every frame waited two or three refreshes.
+        if !self.capture_asked {
+            self.capturer.request_frame().ok();
+            self.capture_asked = true;
+        }
         let now = Instant::now();
         // Only a wait on the byte cap is congestion; count it once per
         // frame. A wait on the pace timer or the writer queue is not (the
@@ -866,13 +898,6 @@ impl Session {
                     }
                 }
             }
-        }
-        // Keep one capture request outstanding even while blocked: a newer
-        // frame replaces `pending` (latest wins), so the frame that finally
-        // goes out on a slow link is current, not as old as the stall.
-        if !self.capture_asked {
-            self.capturer.request_frame().ok();
-            self.capture_asked = true;
         }
         Ok(())
     }
@@ -1182,7 +1207,12 @@ impl Session {
                 && self.link.inflight_bytes() + total as u64 + self.link.est_frame_bytes() <= cap);
         self.writer.send(msg, vec![encoded.main, aux]);
         self.ctl.note_frame_sent(now);
-        self.link.on_sent(t0, self.frame_id, total, app_limited);
+        // In flight from now, when it leaves, not from the encode start: at
+        // 100 fps the encode alone is most of a frame interval, and counting
+        // it made the round trip outlast the interval, so the byte cap
+        // blocked an idle LAN and the controller read content swings as
+        // congestion.
+        self.link.on_sent(now, self.frame_id, total, app_limited);
         self.note_encode_time(enc_us as f64);
         // Pace from the encode start so a slow encode adds no extra wait;
         // after an idle gap or a stall the cadence restarts one interval
@@ -1578,7 +1608,7 @@ fn setup_output(
     output.name = m.name.clone();
     let width = caps.max_width.clamp(320, 1920) & !1;
     let height = caps.max_height.clamp(240, 1080) & !1;
-    if let Err(e) = instance.set_monitor_mode(&output.name, width, height, 60, 1.0) {
+    if let Err(e) = instance.set_monitor_mode(&output.name, width, height, HEADLESS_HZ, 1.0) {
         tracing::warn!(error = %e, "could not set the headless output mode");
     }
     // Hyprland applies the mode asynchronously; stream whatever it settled
@@ -1617,17 +1647,20 @@ fn start_capture(
     render_node: &std::path::Path,
     capture: CaptureMode,
     allow_shm: bool,
+    import_modifiers: Option<Vec<(u32, Vec<u64>)>>,
     tx: UnboundedSender<Incoming>,
 ) -> Result<Capturer> {
     let mut cc = CaptureConfig::new(output.to_string());
     cc.target = target.clone();
     cc.render_node = render_node.to_path_buf();
     cc.shm_fallback = allow_shm;
+    cc.import_modifiers = import_modifiers;
     cc.mode = capture;
     cc.cursor = true;
-    // One extra ring slot: the session pins the last sent frame for
-    // still-picture refinement.
-    cc.buffers = 4;
+    // The session holds up to three (the last sent frame, pinned for
+    // still-picture refinement, the one encoding and the newest pending)
+    // while the capture has up to three in flight.
+    cc.buffers = 7;
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
             CaptureEvent::Frame(frame) => Incoming::Frame(frame),

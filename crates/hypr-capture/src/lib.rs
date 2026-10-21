@@ -108,10 +108,16 @@ pub struct CaptureConfig {
     pub mode: CaptureMode,
     /// GBM device for dmabufs; when it cannot be opened capture uses wl_shm.
     pub render_node: PathBuf,
-    /// Ring size; 3 keeps one frame in flight while one is consumed.
+    /// Ring size. Up to three frames are in flight (one per screen session)
+    /// on top of what the consumer holds.
     pub buffers: usize,
     /// Prefer a linear modifier so the CPU can map frames cheaply.
     pub prefer_linear: bool,
+    /// The modifiers the consumer can import, per DRM fourcc. For a listed
+    /// format the dmabuf ring takes only these, ahead of `prefer_linear`, so
+    /// a GPU consumer gets the compositor's tiled layout: copying into and
+    /// sampling from a linear buffer is several times slower on Intel.
+    pub import_modifiers: Option<Vec<(u32, Vec<u64>)>>,
     /// With `prefer_linear`, capture into wl_shm buffers when no dmabuf format
     /// offers the linear modifier. NVIDIA offers only tiled modifiers, which
     /// GBM cannot map for the CPU.
@@ -145,6 +151,7 @@ impl CaptureConfig {
             render_node: PathBuf::from(DEFAULT_RENDER_NODE),
             buffers: 3,
             prefer_linear: true,
+            import_modifiers: None,
             shm_fallback: true,
             cursor: true,
         }

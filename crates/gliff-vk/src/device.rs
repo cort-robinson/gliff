@@ -357,6 +357,19 @@ impl Gpu {
         format: vk::Format,
         modifier: u64,
     ) -> Option<(u32, vk::FormatFeatureFlags)> {
+        self.modifier_list(format)
+            .iter()
+            .find(|e| e.drm_format_modifier == modifier)
+            .map(|e| {
+                (
+                    e.drm_format_modifier_plane_count,
+                    e.drm_format_modifier_tiling_features,
+                )
+            })
+    }
+
+    /// Every DRM modifier the driver lists for `format`.
+    fn modifier_list(&self, format: vk::Format) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
         // SAFETY: two-call pattern on a valid physical device; the list is
         // sized from the first call before the second fills it.
         unsafe {
@@ -374,15 +387,27 @@ impl Gpu {
             self.instance
                 .get_physical_device_format_properties2(self.physical, format, &mut props);
             entries
-                .iter()
-                .find(|e| e.drm_format_modifier == modifier)
-                .map(|e| {
-                    (
-                        e.drm_format_modifier_plane_count,
-                        e.drm_format_modifier_tiling_features,
-                    )
-                })
         }
+    }
+
+    /// The DRM modifiers a captured frame of `fourcc` can be imported with:
+    /// one memory plane (the import takes one) and sampled with linear
+    /// filtering (the split shader's sampler). Empty for a format the
+    /// pipeline does not take.
+    pub fn capture_modifiers(&self, fourcc: drm_fourcc::DrmFourcc) -> Vec<u64> {
+        let Some(format) = crate::image::capture_format(fourcc) else {
+            return Vec::new();
+        };
+        let wanted = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        self.modifier_list(format)
+            .iter()
+            .filter(|e| {
+                e.drm_format_modifier_plane_count == 1
+                    && e.drm_format_modifier_tiling_features.contains(wanted)
+            })
+            .map(|e| e.drm_format_modifier)
+            .collect()
     }
 
     /// Wait for the whole device to go idle (teardown, resize).

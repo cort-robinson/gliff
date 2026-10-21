@@ -87,14 +87,20 @@ Skylake on, including Lunar Lake, Battlemage and Panther Lake. Vulkan Video
 is not used, so no `ANV_DEBUG` flags are needed.
 
 It has run on Panther Lake (Xe3): `gliff-probe gpu`, `surfaces`,
-`roundtrip` and `pipeline` pass, and so does `scripts/e2e.sh`. Earlier
-generations are not yet run. The items below are what the code expects of
-iHD, from the Mesa and libva sources; they are the first things to check, in
-that probe order, when a new generation fails:
+`roundtrip` and `pipeline` pass, and so does `scripts/e2e.sh`. It has also
+streamed from Coffee Lake (UHD 630, a 2018 Intel Mac mini). The items below
+are what the code expects of iHD, from the Mesa and libva sources; they are
+the first things to check, in that probe order, when a new generation fails:
 
 - **Entrypoint.** On Gen12 and later iHD offers `VAEntrypointEncSliceLP`
-  (VDEnc) for H.264, which gliff takes when `EncSlice` is absent. CBR on it
-  needs the HuC firmware; a FAIL with "no CBR" means `dmesg | grep -i huc`.
+  (VDEnc) for H.264. Gen9 offers `EncSlice`, which runs on the shader cores,
+  and offers `EncSliceLP` too once the HuC firmware loads
+  (`i915.enable_guc=2`). gliff prefers `EncSliceLP` when both are offered:
+  on the UHD 630 it encoded a 1440p desktop in 6 ms (p95 6 ms) against
+  10 ms (p95 17 ms), because `EncSlice` competes with the compositor for the
+  shader cores. `GLIFF_VA_ENCODE=slice` prefers `EncSlice`. CBR on
+  `EncSliceLP` needs the HuC firmware; a FAIL with "no CBR" means
+  `dmesg | grep -i huc`.
 - **Packed headers.** iHD requires them and gliff always supplies them.
 - **The hand-off.** iHD exports NV12 with a Y-tiled or Tile4 modifier; ANV
   must import it with STORAGE for the direct path, else the copy path runs.

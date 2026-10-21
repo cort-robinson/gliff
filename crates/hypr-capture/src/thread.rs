@@ -56,11 +56,42 @@ pub enum Cmd {
     Stop,
 }
 
-/// Which session an object belongs to.
+/// Which session an object belongs to: a screen session by index, or the
+/// cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
-    Screen,
+    Screen(usize),
     Cursor,
+}
+
+/// Screen capture sessions on the one output. A session holds one frame at
+/// a time, and Hyprland copies a frame at the render after the request but
+/// sends `ready` about a refresh later. With one session the next request
+/// went out only on `ready`, after the next render had often begun, so the
+/// capture took two frames in three (about 70 fps at 100 Hz). Another
+/// session asks as soon as a frame is copied; a third keeps one free while
+/// two wait for `ready`, which at 120 Hz can take more than a refresh.
+const SCREEN_SESSIONS: usize = 3;
+
+struct ScreenSession {
+    session: ExtImageCopyCaptureSessionV1,
+    /// Constraints have arrived, so frames may be created.
+    done: bool,
+    in_flight: Option<InFlight>,
+}
+
+/// A screen frame requested from the compositor and not yet ready.
+struct InFlight {
+    frame: ExtImageCopyCaptureFrameV1,
+    slot: usize,
+    /// Request order, so a frame that completes after a newer one is dropped.
+    order: u64,
+    damage: Vec<Rect>,
+    presentation: u64,
+    transform: u32,
+    /// The compositor has copied into the buffer (its presentation time
+    /// came); `ready` follows later.
+    copied: bool,
 }
 
 struct RingSlot {
@@ -113,17 +144,17 @@ struct State {
 
     output: Option<(WlOutput, OutputInfo)>,
     source: Option<ExtImageCaptureSourceV1>,
-    session: Option<ExtImageCopyCaptureSessionV1>,
+    sessions: Vec<ScreenSession>,
+    /// Filled from the first session; the others capture the same source.
     constraints: Constraints,
     ring: Vec<RingSlot>,
     ring_generation: u64,
     ring_format: Option<(u32, u64)>,
-    in_flight: Option<(ExtImageCopyCaptureFrameV1, usize)>,
-    pending_damage: Vec<Rect>,
-    pending_presentation: u64,
-    pending_transform: u32,
     want_frame: bool,
     sequence: u64,
+    /// Request order of the last capture started and of the last emitted.
+    requested: u64,
+    emitted: u64,
 
     pointer: Option<WlPointer>,
     cursor_session: Option<ExtImageCopyCaptureCursorSessionV1>,
@@ -234,17 +265,15 @@ fn run(
         cmd_tx,
         output: None,
         source: None,
-        session: None,
+        sessions: Vec::new(),
         constraints: Constraints::default(),
         ring: Vec::new(),
         ring_generation: 0,
         ring_format: None,
-        in_flight: None,
-        pending_damage: Vec::new(),
-        pending_presentation: 0,
-        pending_transform: 0,
         want_frame: false,
         sequence: 0,
+        requested: 0,
+        emitted: 0,
         pointer: None,
         cursor_session: None,
         cursor_capture: None,
@@ -345,12 +374,19 @@ fn run_loop(
     state.output = Some((output.clone(), info));
 
     let source = state.source_mgr.create_source(&output, &qh, ());
-    let session =
-        state
-            .copy_mgr
-            .create_session(&source, manager::Options::empty(), &qh, Kind::Screen);
+    state.sessions = (0..SCREEN_SESSIONS)
+        .map(|i| ScreenSession {
+            session: state.copy_mgr.create_session(
+                &source,
+                manager::Options::empty(),
+                &qh,
+                Kind::Screen(i),
+            ),
+            done: false,
+            in_flight: None,
+        })
+        .collect();
     state.source = Some(source);
-    state.session = Some(session);
 
     if state.cfg.cursor && state.shm.is_some() {
         state.start_cursor_session();
@@ -406,10 +442,8 @@ impl LoopState for State {
                 self.maybe_capture();
             }
             Cmd::Recapture => {
-                if let Some((frame, _)) = self.in_flight.take() {
-                    // Its slot was never marked busy, so it is reused.
-                    frame.destroy();
-                }
+                // Their slots were never marked busy, so they are reused.
+                self.abandon_in_flight();
                 self.want_frame = true;
                 self.maybe_capture();
             }
@@ -421,9 +455,7 @@ impl LoopState for State {
                     self.stop();
                     return;
                 }
-                if let Some((frame, _)) = self.in_flight.take() {
-                    frame.destroy();
-                }
+                self.abandon_in_flight();
                 self.cfg.mode = CaptureMode::Shm;
                 self.gbm = None;
                 if let Err(e) = self.allocate_ring() {
@@ -460,16 +492,26 @@ impl State {
         (self.sink)(ev);
     }
 
-    fn teardown(&mut self) {
-        if let Some((frame, _)) = self.in_flight.take() {
-            frame.destroy();
+    /// Destroy every frame still in flight; true when there was one.
+    fn abandon_in_flight(&mut self) -> bool {
+        let mut any = false;
+        for s in &mut self.sessions {
+            if let Some(f) = s.in_flight.take() {
+                f.frame.destroy();
+                any = true;
+            }
         }
+        any
+    }
+
+    fn teardown(&mut self) {
+        self.abandon_in_flight();
         self.teardown_cursor();
         for slot in self.ring.drain(..) {
             slot.destroy();
         }
-        if let Some(s) = self.session.take() {
-            s.destroy();
+        for s in self.sessions.drain(..) {
+            s.session.destroy();
         }
         if let Some(s) = self.source.take() {
             s.destroy();
@@ -491,6 +533,21 @@ impl State {
                 .iter()
                 .find(|(f, _)| *f == want as u32)
             {
+                let importable = self.cfg.import_modifiers.as_ref().and_then(|list| {
+                    list.iter()
+                        .find(|(format, _)| format == f)
+                        .map(|(_, allowed)| allowed)
+                });
+                if let Some(allowed) = importable {
+                    let usable: Vec<u64> = mods
+                        .iter()
+                        .copied()
+                        .filter(|m| allowed.contains(m))
+                        .collect();
+                    if !usable.is_empty() {
+                        return Some((*f, usable));
+                    }
+                }
                 let linear = u64::from(DrmModifier::Linear);
                 let mut mods = mods.clone();
                 if self.cfg.prefer_linear && mods.contains(&linear) {
@@ -728,17 +785,41 @@ impl State {
         });
     }
 
+    /// Start a capture when none is waiting for the compositor's next
+    /// render and one is wanted: asked for, or a prefetch while a copied
+    /// frame is still on its way (its consumer asks for the next one only
+    /// once it has it, which is a refresh too late).
     fn maybe_capture(&mut self) {
-        if !self.want_frame || self.in_flight.is_some() || self.stopped || self.ring.is_empty() {
+        if self.stopped || self.ring.is_empty() {
             return;
         }
-        let Some(session) = self.session.clone() else {
+        let in_flight: Vec<&InFlight> = self
+            .sessions
+            .iter()
+            .filter_map(|s| s.in_flight.as_ref())
+            .collect();
+        if in_flight.iter().any(|f| !f.copied) {
+            return;
+        }
+        let prefetch = !in_flight.is_empty();
+        if !self.want_frame && !prefetch {
+            return;
+        }
+        let taken: Vec<usize> = in_flight.iter().map(|f| f.slot).collect();
+        let Some(si) = self
+            .sessions
+            .iter()
+            .position(|s| s.done && s.in_flight.is_none())
+        else {
             return;
         };
-        let Some(idx) = self.ring.iter().position(|s| !s.busy) else {
+        let Some(idx) = (0..self.ring.len()).find(|i| !self.ring[*i].busy && !taken.contains(i))
+        else {
             return;
         };
-        let frame = session.create_frame(&self.qh, Kind::Screen);
+        let frame = self.sessions[si]
+            .session
+            .create_frame(&self.qh, Kind::Screen(si));
         frame.attach_buffer(&self.ring[idx].wl_buffer);
         let (w, h) = (
             self.ring[idx].buffer.info.width as i32,
@@ -746,17 +827,46 @@ impl State {
         );
         frame.damage_buffer(0, 0, w, h);
         frame.capture();
-        tracing::debug!(slot = idx, "capture requested");
-        self.pending_damage.clear();
-        self.pending_presentation = 0;
-        self.in_flight = Some((frame, idx));
+        tracing::debug!(
+            session = si,
+            slot = idx,
+            prefetch = !self.want_frame,
+            "capture requested"
+        );
+        self.requested += 1;
+        self.sessions[si].in_flight = Some(InFlight {
+            frame,
+            slot: idx,
+            order: self.requested,
+            damage: Vec::new(),
+            presentation: 0,
+            transform: 0,
+            copied: false,
+        });
         self.want_frame = false;
     }
 
     fn on_session_event(&mut self, kind: Kind, event: session_proto::Event) {
         tracing::debug!(?kind, ?event, "session event");
+        if let Kind::Screen(i @ 1..) = kind {
+            // The extra sessions see the first one's constraints.
+            match event {
+                session_proto::Event::Done => {
+                    if let Some(s) = self.sessions.get_mut(i) {
+                        s.done = true;
+                    }
+                    self.maybe_capture();
+                }
+                session_proto::Event::Stopped => {
+                    self.stopped = true;
+                    self.emit(CaptureEvent::Stopped);
+                }
+                _ => {}
+            }
+            return;
+        }
         let c = match kind {
-            Kind::Screen => &mut self.constraints,
+            Kind::Screen(_) => &mut self.constraints,
             Kind::Cursor => &mut self.cursor_constraints,
         };
         match event {
@@ -780,7 +890,10 @@ impl State {
             session_proto::Event::Done => {
                 c.done = true;
                 match kind {
-                    Kind::Screen => {
+                    Kind::Screen(i) => {
+                        if let Some(s) = self.sessions.get_mut(i) {
+                            s.done = true;
+                        }
                         let size_changed = self
                             .ring
                             .first()
@@ -790,8 +903,7 @@ impl State {
                             })
                             .unwrap_or(true);
                         if size_changed {
-                            if let Some((frame, _)) = self.in_flight.take() {
-                                frame.destroy();
+                            if self.abandon_in_flight() {
                                 self.want_frame = true;
                             }
                             if let Err(e) = self.allocate_ring() {
@@ -816,7 +928,7 @@ impl State {
                     }
                 }
             }
-            session_proto::Event::Stopped if kind == Kind::Screen => {
+            session_proto::Event::Stopped if matches!(kind, Kind::Screen(_)) => {
                 self.stopped = true;
                 self.emit(CaptureEvent::Stopped);
             }
@@ -830,37 +942,34 @@ impl State {
         frame: &ExtImageCopyCaptureFrameV1,
         event: frame_proto::Event,
     ) {
-        tracing::debug!(
-            ?kind,
-            ?event,
-            in_flight = self.in_flight.as_ref().map(|(f, _)| f == frame),
-            "frame event"
-        );
+        tracing::debug!(?kind, ?event, "frame event");
         match kind {
-            Kind::Screen => self.on_screen_frame_event(frame, event),
+            Kind::Screen(i) => self.on_screen_frame_event(i, frame, event),
             Kind::Cursor => self.on_cursor_frame_event(frame, event),
         }
     }
 
     fn on_screen_frame_event(
         &mut self,
+        session: usize,
         frame: &ExtImageCopyCaptureFrameV1,
         event: frame_proto::Event,
     ) {
-        let Some((cur, idx)) = self.in_flight.as_ref() else {
+        let Some(f) = self
+            .sessions
+            .get_mut(session)
+            .and_then(|s| s.in_flight.as_mut())
+            .filter(|f| &f.frame == frame)
+        else {
             return;
         };
-        if cur != frame {
-            return;
-        }
-        let idx = *idx;
         match event {
             frame_proto::Event::Damage {
                 x,
                 y,
                 width,
                 height,
-            } => self.pending_damage.push(Rect {
+            } => f.damage.push(Rect {
                 x,
                 y,
                 width,
@@ -872,30 +981,46 @@ impl State {
                 tv_nsec,
             } => {
                 let secs = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
-                self.pending_presentation = secs * 1_000_000_000 + tv_nsec as u64;
+                f.presentation = secs * 1_000_000_000 + tv_nsec as u64;
+                f.copied = true;
+                // Copied: queue the next capture for the following render.
+                self.maybe_capture();
             }
             frame_proto::Event::Transform { transform } => {
-                self.pending_transform = transform.into();
+                f.transform = transform.into();
             }
             frame_proto::Event::Ready => {
-                let (frame, _) = self.in_flight.take().expect("checked above");
-                frame.destroy();
-                self.ring[idx].busy = true;
-                self.sequence += 1;
-                let captured = CapturedFrame {
-                    buffer: Arc::clone(&self.ring[idx].buffer),
-                    damage: std::mem::take(&mut self.pending_damage),
-                    presentation_ns: self.pending_presentation,
-                    sequence: self.sequence,
-                    transform: self.pending_transform,
-                    release: Some(self.cmd_tx.clone()),
-                };
-                self.emit(CaptureEvent::Frame(captured));
+                let f = self.sessions[session]
+                    .in_flight
+                    .take()
+                    .expect("checked above");
+                f.frame.destroy();
+                if f.order < self.emitted {
+                    // A newer frame went out first, so this one is stale.
+                    // Its slot was never marked busy.
+                    tracing::debug!(order = f.order, "dropped a stale capture");
+                } else {
+                    self.emitted = f.order;
+                    self.ring[f.slot].busy = true;
+                    self.sequence += 1;
+                    let captured = CapturedFrame {
+                        buffer: Arc::clone(&self.ring[f.slot].buffer),
+                        damage: f.damage,
+                        presentation_ns: f.presentation,
+                        sequence: self.sequence,
+                        transform: f.transform,
+                        release: Some(self.cmd_tx.clone()),
+                    };
+                    self.emit(CaptureEvent::Frame(captured));
+                }
                 self.maybe_capture();
             }
             frame_proto::Event::Failed { reason } => {
-                let (frame, _) = self.in_flight.take().expect("checked above");
-                frame.destroy();
+                let f = self.sessions[session]
+                    .in_flight
+                    .take()
+                    .expect("checked above");
+                f.frame.destroy();
                 tracing::warn!(?reason, "capture frame failed");
                 match reason {
                     wayland_client::WEnum::Value(frame_proto::FailureReason::Stopped) => {

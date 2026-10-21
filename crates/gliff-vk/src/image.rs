@@ -15,6 +15,15 @@ use crate::{Error, Result};
 pub const NV12: vk::Format = vk::Format::G8_B8R8_2PLANE_420_UNORM;
 pub const LINEAR_MODIFIER: u64 = 0;
 
+/// The Vulkan format a captured 32-bit RGB frame is sampled as.
+pub(crate) fn capture_format(fourcc: DrmFourcc) -> Option<vk::Format> {
+    match fourcc {
+        DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => Some(vk::Format::B8G8R8A8_UNORM),
+        DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => Some(vk::Format::R8G8B8A8_UNORM),
+        _ => None,
+    }
+}
+
 /// A dmabuf plane description shared with the capture and display sides.
 pub struct DmabufPlane<'a> {
     pub fd: BorrowedFd<'a>,
@@ -350,11 +359,8 @@ impl Image {
 
     /// Import a captured dmabuf (single-plane 32-bit RGB) for sampling.
     pub(crate) fn import_dmabuf(gpu: &Arc<Gpu>, plane: &DmabufPlane) -> Result<Self> {
-        let format = match plane.fourcc {
-            DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => vk::Format::B8G8R8A8_UNORM,
-            DrmFourcc::Xbgr8888 | DrmFourcc::Abgr8888 => vk::Format::R8G8B8A8_UNORM,
-            other => return Err(Error::Unsupported(format!("capture format {other:?}"))),
-        };
+        let format = capture_format(plane.fourcc)
+            .ok_or_else(|| Error::Unsupported(format!("capture format {:?}", plane.fourcc)))?;
         let layouts = [vk::SubresourceLayout {
             offset: plane.offset as u64,
             size: 0,

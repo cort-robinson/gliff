@@ -316,14 +316,20 @@ pub struct Level {
 }
 
 /// Frame rate degrades first, because the pointer is local and a sharp
-/// still picture matters more on a desktop than motion; then the chroma
+/// still picture matters more on a desktop than motion, in halves from the
+/// session maximum (above 60 on a fast display) to 15; then the chroma
 /// detail (Dual420 -> Single420 costs only coloured fringes); resolution
 /// last, because it is the most visible loss on text. The fps floors are
 /// policy: never below 15 before chroma is given up, never below 10 before
 /// resolution, 5 is the absolute floor.
-pub const LEVELS: [Level; 7] = [
+pub const LEVELS: [Level; 8] = [
     Level {
         fps_cap: u32::MAX,
+        aux: true,
+        scale: 1.0,
+    },
+    Level {
+        fps_cap: 60,
         aux: true,
         scale: 1.0,
     },
@@ -847,7 +853,7 @@ mod tests {
             Self {
                 link: LinkEstimator::new(),
                 ctl: RateController::new(pixels, streams, max_fps, None),
-                ladder: Ladder::new(1),
+                ladder: Ladder::new(2),
                 pixels,
                 streams,
                 max_fps,
@@ -1053,14 +1059,14 @@ mod tests {
             sim.ctl.target()
         );
         assert_eq!(sim.ladder.index(), 0);
-        assert!(sim.level_changes.iter().all(|(_, level)| *level < 2));
+        assert!(sim.level_changes.iter().all(|(_, level)| *level < 3));
     }
 
     #[test]
     fn a_slow_link_still_moves_down_during_startup() {
         let mut sim = Sim::new(2560 * 1440, 2, 60);
         sim.run(8.0, 30, 70.0, 2.5e6);
-        assert!(sim.ladder.index() >= 2, "level {}", sim.ladder.index());
+        assert!(sim.ladder.index() >= 3, "level {}", sim.ladder.index());
         assert!(sim.ctl.target() < 4_000_000, "target {}", sim.ctl.target());
     }
 
@@ -1070,7 +1076,7 @@ mod tests {
         sim.run(6.0, 30, 70.0, 40e6);
         assert_eq!(sim.ladder.index(), 0);
         sim.run(8.0, 30, 70.0, 2.5e6);
-        assert!(sim.ladder.index() >= 2, "level {}", sim.ladder.index());
+        assert!(sim.ladder.index() >= 3, "level {}", sim.ladder.index());
         assert!(sim.ctl.target() < 4_000_000, "target {}", sim.ctl.target());
     }
 
@@ -1130,8 +1136,8 @@ mod tests {
             // (rate, pixels, dual, expected level)
             (50e6, 1920 * 1080, true, 0),  // lan: full quality
             (20e6, 1920 * 1080, true, 0),  // dsl still affords 60 fps dual
-            (2.5e6, 2560 * 1440, true, 3), // satellite: 15 fps single, full res
-            (0.3e6, 2560 * 1440, true, 6), // worse than the ladder: last level
+            (2.5e6, 2560 * 1440, true, 4), // satellite: 15 fps single, full res
+            (0.3e6, 2560 * 1440, true, 7), // worse than the ladder: last level
         ];
         for (rate, pixels, dual, expected) in cases {
             let got = Ladder::select(rate, pixels, dual, true, 60, 1.0);
@@ -1145,21 +1151,21 @@ mod tests {
         // stream, so the satellite rate must buy a deeper rung (lower fps
         // or resolution) instead of an undecodable Single420 one.
         let sel = Ladder::select(2.5e6, 2560 * 1440, true, false, 60, 1.0);
-        assert_eq!(sel, 5, "expected the half-resolution rung, got {sel}");
+        assert_eq!(sel, 6, "expected the half-resolution rung, got {sel}");
     }
 
     #[test]
     fn startup_downshift_waits_for_congestion() {
         let (link, now) = link_at(2.5e6);
-        let mut ladder = Ladder::new(1);
+        let mut ladder = Ladder::new(2);
         let moved = ladder.consider(now, &link, true, false, 2560 * 1440, true, true, 60);
         assert_eq!(moved, None);
         assert_eq!(
             ladder.consider(now, &link, true, true, 2560 * 1440, true, true, 60),
-            Some(3)
+            Some(4)
         );
         let (link, now) = link_at(50e6);
-        let mut ladder = Ladder::new(1);
+        let mut ladder = Ladder::new(2);
         assert_eq!(
             ladder.consider(now, &link, true, false, 1920 * 1080, true, true, 60),
             Some(0)
@@ -1170,12 +1176,12 @@ mod tests {
     fn a_flap_doubles_the_up_hold() {
         let pixels = 2560 * 1440;
         let (link, mut now) = link_at(2.5e6);
-        let mut ladder = Ladder::new(3);
+        let mut ladder = Ladder::new(4);
         // Probe up succeeds after the hold on a briefly-better link...
         let (good, good_now) = link_at(8e6);
         now = now.max(good_now) + HOLD_UP;
         let up = ladder.consider(now, &good, false, false, pixels, true, true, 60);
-        assert!(up.is_some_and(|i| i < 3), "no step up: {up:?}");
+        assert!(up.is_some_and(|i| i < 4), "no step up: {up:?}");
         // ...then the link is what it was; after HOLD_DOWN it steps back.
         now += HOLD_DOWN;
         let down = ladder.consider(now, &link, false, false, pixels, true, true, 60);
@@ -1188,13 +1194,13 @@ mod tests {
             link2.on_sent(t, id, bytes, false);
             t += Duration::from_millis(400);
             link2.on_ack(t, id);
-            if ladder.index() >= 3 {
+            if ladder.index() >= 4 {
                 break;
             }
             ladder.consider(t, &link2, false, false, pixels, true, true, 60);
         }
         let _ = down;
-        assert!(ladder.index() >= 3, "did not step back down");
+        assert!(ladder.index() >= 4, "did not step back down");
         assert!(ladder.hold_up > HOLD_UP, "hold_up did not double on a flap");
     }
 

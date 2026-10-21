@@ -51,7 +51,7 @@ video, cursor and pongs flow server→client.
 | `gliff-transport` | `Framed` length-prefixed IO with out-of-band payloads (`write_vectored`), the clipboard transfer engine and file spool, ssh spawn | none |
 | `hypr-ipc` | Hyprland control socket (instance discovery, outputs, options) | none |
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
-| `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
+| `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread, three alternating screen sessions | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer + clipboard bridge (mime types and pipes) on calloop threads | none |
 | `gliff-va` | libva display, H.264 encode/decode contexts on driver-owned surfaces, dmabuf export, the H.264 header parser and writer | yes, libva calls through committed bindgen output |
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, the pipeline that hands surfaces to `gliff-va` | yes, Vulkan API calls |
@@ -153,7 +153,9 @@ Every crate with `unsafe` documents the safety requirements at each block.
   count, so latency does not cap the frame rate and a slow client cannot
   build a backlog. Frames are captured on demand, so a static screen costs
   nothing; a request stays outstanding while sending is blocked, so the frame
-  that finally goes out is current.
+  that finally goes out is current. The next frame is requested before the
+  current one is encoded, so the encode never makes the capture miss a
+  refresh: on a 100 Hz display, asking after it held a 60 fps video to 40.
   A separate writer task owns the socket write half and keeps at most one
   queued encoded frame; unsent cursor and pong messages are coalesced,
   clipboard messages are never coalesced (transfers are ordered and
@@ -174,8 +176,8 @@ Every crate with `unsafe` documents the safety requirements at each block.
   after two consecutive evaluations of sustained queueing while blocked —
   one TCP loss-recovery stall never cuts. A future UDP transport feeds the
   same estimator inputs (bytes sent, acks, a blocked marker).
-  Above the controller a ladder of seven levels degrades frame rate first
-  (60, 30, 15 fps), then drops the auxiliary chroma stream, then falls to
+  Above the controller a ladder of eight levels degrades frame rate first
+  (120, 60, 30, 15 fps), then drops the auxiliary chroma stream, then falls to
   10 fps, then halves the resolution, with 5 fps as the floor; the level is
   chosen from affordable bits per pixel at the measured rate. During slow start the ladder moves
   freely (the seed jump), so a LAN reaches full quality in under a second
@@ -198,6 +200,21 @@ Every crate with `unsafe` documents the safety requirements at each block.
   releases the ring slot when the encode has finished. On both peers, reads and
   writes run on separate tasks so an input burst cannot starve video and a
   blocked write cannot block reads.
+
+- **Capture cadence.** Hyprland copies a requested frame at its next render
+  but sends `ready` about a refresh later, and a capture session holds one
+  frame at a time. Asking again only on `ready` lands after the next render
+  has begun, so one session captured two frames in three (about 70 fps on a
+  100 Hz display). The capture thread runs three sessions on the output and
+  starts the next capture as soon as the current frame's presentation time
+  arrives (it is copied), so a request is always waiting for the next render;
+  a frame that completes after a newer one is dropped. With the GPU tier the
+  ring is allocated in a tiled layout Vulkan can sample (single-plane, from
+  the driver's modifier list) rather than linear: on an Intel UHD 630 that
+  cut the split from about 4 ms to 1.5 ms at 1440p, the compositor's copy
+  shrinks the same way, and the stream reached the display's 100 Hz. At
+  120 Hz the capture still gets every refresh, and the serial split and
+  encode (7.6 ms) hold the stream near 97 fps on that GPU.
 
 - **Client display.** The decode worker exports each finished BGRX image as a
   linear dmabuf and the UI wraps it in a `GdkDmabufTexture` on a

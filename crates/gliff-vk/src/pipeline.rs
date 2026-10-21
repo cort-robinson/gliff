@@ -279,6 +279,7 @@ impl Encoder {
     ) -> Result<EncodedFrame> {
         let (w, h) = (self.settings.width, self.settings.height);
         let (split, main, aux) = (&self.split, &self.main, self.aux.as_ref());
+        let started = std::time::Instant::now();
         // The split blocks until it is done: the encoder reads the surfaces
         // through VA-API, which knows nothing of Vulkan's fences, or on the
         // Vulkan encode queue, which then needs no semaphore.
@@ -299,6 +300,7 @@ impl Encoder {
                 }
                 Ok(())
             })?;
+        let split_us = started.elapsed().as_micros() as u64;
         // Submit both encodes, then wait: the main stream's readback overlaps
         // the aux encode on the GPU.
         let main_pending = self.main.submit(force_keyframe)?;
@@ -311,6 +313,11 @@ impl Encoder {
             (Some(a), Some(pending)) => Some(a.finish(pending)?),
             _ => None,
         };
+        tracing::trace!(
+            split_us,
+            encode_us = started.elapsed().as_micros() as u64 - split_us,
+            "encoded frame"
+        );
         Ok(EncodedFrame {
             keyframe: main.keyframe,
             main: main.data,

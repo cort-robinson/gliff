@@ -158,7 +158,7 @@ unsafe extern "C" fn log_info(_ctx: *mut c_void, message: *const c_char) {
 #[derive(Debug, Clone)]
 pub struct Caps {
     /// The encode entrypoint to use, when encode is possible at all:
-    /// `VAEntrypointEncSlice` when offered, else the low-power one.
+    /// `VAEntrypointEncSliceLP` when offered, else the shader one.
     pub encode_entrypoint: Option<va::VAEntrypoint>,
     pub decode: bool,
     /// `VA_RC_*` bits the encode entrypoint supports.
@@ -205,8 +205,17 @@ impl Caps {
         }
         // The first entrypoint that can run the way gliff drives it, else
         // the first one offered so the failure names its shortcoming.
+        // The low-power (fixed-function) encoder first: on an Intel Gen9 GPU
+        // with HuC loaded, which offers both, it encoded a 1440p desktop in
+        // 6 ms against 10 ms (p95 6 against 17), because the other one runs
+        // on the shader cores the compositor is also using.
+        // GLIFF_VA_ENCODE=slice prefers the shader one.
+        let mut order = [va::VAEntrypointEncSliceLP, va::VAEntrypointEncSlice];
+        if std::env::var("GLIFF_VA_ENCODE").is_ok_and(|v| v == "slice") {
+            order.reverse();
+        }
         let mut first = None;
-        for entrypoint in [va::VAEntrypointEncSlice, va::VAEntrypointEncSliceLP] {
+        for entrypoint in order {
             if !entrypoints.contains(&entrypoint) {
                 continue;
             }
