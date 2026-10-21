@@ -25,7 +25,8 @@ both ends, and falls back to the CPU on machines where it cannot.
 
 ## Requirements
 
-- Hyprland on both machines, with a session running on the remote one.
+- Hyprland on the remote machine, with a session running. Your machine runs
+  Hyprland too, or Windows 11 (see [From Windows](#from-windows)).
 - ssh access from your machine to the remote one.
 - For GPU video: an AMD or Intel GPU with its Vulkan and VA-API drivers
   (on Arch, `vulkan-radeon` and `mesa` for AMD, or `vulkan-intel` and
@@ -112,6 +113,51 @@ room. Two flags change the video, and you pass them to the server through
 ```
 gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
+
+## From Windows
+
+`gliff.exe` connects from Windows 11 to a Hyprland machine the same way,
+over the ssh client Windows ships with. The remote machine needs only the
+usual `gliff-server`.
+
+There is no Windows package yet; build it with Rust (the MSVC toolchain)
+and the Visual Studio C++ build tools, which compile OpenH264 from source:
+
+```
+git clone https://github.com/omacom/gliff.git
+cd gliff
+cargo build --release -p gliff
+```
+
+Then, from a terminal:
+
+```
+target\release\gliff.exe user@host
+```
+
+ssh asks for passwords and host keys in that terminal, so set up key
+authentication for a window that connects by itself. `--headless`,
+`--output`, `--server-bin`, `--no-clipboard` and `--release-hotkey` work as
+on Linux, and a bare `gliff.exe` connects to the machine it showed last.
+
+How it differs from the Linux client:
+
+- One machine per window; start another `gliff.exe` for a second machine.
+- Video is one 4:2:0 stream, so coloured text is not as sharp as with 4:4:4.
+  It decodes on the GPU through Media Foundation and draws through Direct3D
+  11; a machine without a usable GPU decodes on the CPU (OpenH264) and draws
+  with GDI, as does `--video cpu`.
+- While the pointer is over the picture, every key goes to the remote, Win
+  and Alt+Tab included; `Shift+Esc` hands them back. Ctrl+Alt+Del and Win+L
+  always stay with Windows.
+- Keys map by position, and the remote follows the active Windows keyboard
+  layout, including a switch mid-session.
+- Text and images cross the clipboard in both directions; copied files do
+  not yet. Remote copies are marked for clipboard monitors to skip, but a
+  monitor that ignores the marks reads them as soon as they arrive.
+- F11 toggles full screen while the keyboard is not captured. The window
+  menu (Alt+Space, or right-click the title bar) also has full screen,
+  statistics, and reconnect.
 
 ## If something does not work
 

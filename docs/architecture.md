@@ -1,6 +1,7 @@
 # gliff architecture and design
 
-gliff remote-desktops a Hyprland session to another Hyprland machine over SSH.
+gliff remote-desktops a Hyprland session to another Hyprland machine, or to a
+Windows 11 machine, over SSH.
 This document covers what is built, the design choices behind it, and what is
 still pending. Building, running a development setup and the testing tools
 are in `docs/development.md`.
@@ -57,7 +58,7 @@ video, cursor and pongs flow server→client.
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, the pipeline that hands surfaces to `gliff-va` | yes, Vulkan API calls |
 | `gliff-sw` | CPU fallback with OpenH264 encode/decode, fused BGRA<->I420 conversion | the encoder trace level through the raw API, and the AVX2 row kernels (pointer loads and stores) |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
-| `gliff` | GTK4/libadwaita UI, decode worker | one block: hands GTK a dmabuf fd |
+| `gliff` | decode worker; GTK4/libadwaita UI on Linux, Win32 UI on Windows | on Linux one block hands GTK a dmabuf fd; on Windows the Win32 and COM calls (window, GDI, keyboard hook, clipboard, Media Foundation, Direct3D 11, Direct2D) |
 | `gliff-probe` | environment checks and the headless test client | none |
 
 `gliff-vk` wraps `ash` and `gliff-va` wraps libva; both APIs are `unsafe`
@@ -230,6 +231,54 @@ Every crate with `unsafe` documents the safety requirements at each block.
   The picture and pointer mapping share the same layout. In fullscreen the
   header leaves the layout and slides in over the picture at the top edge.
 
+- **Windows client.** The `gliff` crate builds a Win32 window on Windows
+  (`src/win`) around the same decode worker (`net.rs`) and clipboard
+  bridge (`clipboard.rs`) as the GTK client; `gtk_app.rs` and its modules
+  build only on Linux. Its GPU tier (`win/gpu.rs`) stands in for the
+  `gliff-vk` types, so `net.rs` drives it unchanged: one Direct3D 11 device,
+  made by the window and shared with the worker (multithread-protected),
+  Media Foundation's H.264 decoder on it, and a ring of three NV12 textures
+  each picture is copied into. The window draws through a DXGI swap chain
+  (`win/present.rs`): the video processor converts and scales in one pass,
+  and Direct2D draws the labels, only when there are any. It asks for one
+  4:2:0 stream: 4:4:4 is two encodes on the server and would need a second
+  decoder and a recombine pass here.
+  - The SPS gliff's encoders write has no VUI, so a decoder must assume
+    reordering, and Media Foundation's held 16 pictures before the first
+    (low-latency mode did not change that). The client appends a VUI whose
+    bitstream restriction says `max_num_reorder_frames = 0` (`win/sps.rs`,
+    the fix Moonlight applies too); each picture then comes out of the
+    access unit that carried it, and works with any server version.
+  - On an RTX 3080 Ti (2026-10-21) a 1440p decode and copy takes 0.3 ms;
+    the CPU tier takes about 6 ms at 1440p on a Ryzen 7 5800X, and a
+    Dual420 decode with the CPU recombine took 64 ms.
+  - On that machine every flip-model present took 260 ms, whatever was
+    drawn, with RivaTuner's hook loaded; the blit model took 1 ms. The
+    presenter starts in the flip model and moves to the blit model after
+    five presents over 50 ms among the first thirty.
+  - Without a device or swap chain, or with `--video cpu`, the worker
+    decodes with OpenH264 and frames are drawn with GDI `StretchDIBits`,
+    pixel-exact at an integer enlargement (the same fit rule as
+    `paintable::layout`, with the Hyprland mode step for slack) and
+    resampled otherwise.
+
+  The worker's frames and statuses reach the UI thread through two relay
+  threads that post window messages. Keys are captured by a low-level keyboard hook on
+  its own thread (Windows silently drops a hook that keeps it waiting, and
+  the UI thread can block on a paste); each key keeps the owner its press
+  had, so neither side sees a key stuck down when the capture changes, and
+  the synthetic left Ctrl that Windows sends ahead of AltGr is dropped.
+  Keys travel as the evdev code of their set-1 scan code, and the active
+  keyboard layout goes to the server as XKB text that only includes the
+  layout by name (`win/layout.rs`), so the server's own XKB data resolves
+  it. The clipboard uses delayed rendering, so a remote item is fetched
+  when a program pastes it, with a deadline, since that program waits; the
+  proxy carries the formats Windows defines for clipboard monitors to skip
+  (Clipboard History honours them; Free Download Manager and the
+  cross-device clipboard service were seen reading it anyway). The process
+  puts itself in a kill-on-close job object, so its ssh child cannot
+  outlive it.
+
 - **Theme.** `theme.rs` reads Omarchy 4's `colors.toml` with the same lenient
   line parser and fallback chain as `omarchy-theme-color`, and emits a `:root`
   block that overrides the libadwaita palette variables (`--window-bg-color`,
@@ -365,7 +414,10 @@ Not yet built, roughly in priority order:
    answered with a fresh keyframe rather than a retransmit. `LinkEstimator`,
    `RateController` and the ladder already take transport-neutral inputs
    (bytes sent, acks, a blocked marker) and carry over unchanged.
-4. **Polish**: multi-output selection UI, a `--max-fps` server flag, and a
+4. **Windows client**: the 4:4:4 pair on the GPU (a second decoder and a
+   recombine pass), copied files on the clipboard, several machines in one
+   window, and a release binary.
+5. **Polish**: multi-output selection UI, a `--max-fps` server flag, and a
    lazy file spool (a FUSE mount the pasting application
    reads through, so its own copy dialog shows progress, instead of
    spooling every file before the URI list is handed over).

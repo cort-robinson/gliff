@@ -37,6 +37,8 @@ pub enum ToWorker {
     Send(ClientMsg),
     /// Display pixels per stream pixel the decoder should write, so the
     /// picture is drawn 1:1 at an integer scale (see `paintable::layout`).
+    /// Windows draws with GDI, which enlarges exactly by itself.
+    #[cfg_attr(windows, allow(dead_code))]
     Zoom(u32),
     /// The local clipboard changed to these forwardable mime types and files.
     LocalOffer {
@@ -51,7 +53,9 @@ pub enum ToWorker {
         sink: mpsc::Sender<Bytes>,
         result: oneshot::Sender<Result<(), String>>,
     },
-    /// The user pressed cancel on a transfer reported as `id`.
+    /// The user pressed cancel on a transfer reported as `id`. Windows has
+    /// no cancel button; a paste there ends at its deadline instead.
+    #[cfg_attr(windows, allow(dead_code))]
     CancelTransfer(u32),
 }
 

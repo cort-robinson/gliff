@@ -1,6 +1,7 @@
 //! The local keymap to ship to the server, so every key maps the same on
-//! both ends. It follows the compositor: a change of keyboard or layout
-//! mid-session is sent on.
+//! both ends. On Linux it follows the compositor; on Windows the window
+//! follows the active input language (see `win::layout`). A change of
+//! keyboard or layout mid-session is sent on.
 
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ pub type Keymap = watch::Receiver<String>;
 /// server fall back to its default.
 pub const FIRST_KEYMAP_WAIT: Duration = Duration::from_secs(1);
 
+#[cfg(target_os = "linux")]
 pub fn watch() -> Keymap {
     let (tx, rx) = watch::channel(String::new());
     let sink = Box::new(move |text: String| {

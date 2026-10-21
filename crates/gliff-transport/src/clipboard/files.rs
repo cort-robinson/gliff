@@ -148,6 +148,7 @@ impl Spool {
         sweep_stale(base);
         // Pasted files can be private; the spool must not be readable by
         // other local users, whatever the umask.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);

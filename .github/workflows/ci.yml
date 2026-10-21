@@ -40,8 +40,17 @@ jobs:
       - uses: ./.github/actions/setup
       - run: mbx test --workspace --locked
 
+  # The Windows client: the gliff crate alone, as the server side is Linux-only.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add clippy
+      - run: cargo clippy -p gliff --all-targets --locked -- -D warnings
+      - run: cargo test -p gliff --locked
+
   release:
-    needs: [fmt, clippy, test]
+    needs: [fmt, clippy, test, windows]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:

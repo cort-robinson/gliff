@@ -1,6 +1,7 @@
 //! The client's network and decode worker: connect (TCP or ssh), run the
 //! protocol, decode the streams on the GPU, and hand finished display frames
-//! (dmabufs) to the GTK thread. Input commands flow the other way.
+//! (dmabufs, or BGRA pixels from the CPU tier) to the UI thread. Input
+//! commands flow the other way.
 //!
 //! The Vulkan objects live entirely on this worker thread; only dmabuf fds
 //! and plain values cross to the GTK thread.
@@ -20,12 +21,15 @@ use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
+#[cfg(target_os = "linux")]
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 
 use crate::clipboard::{Bridge, ToWorker};
 use crate::keymap::{Keymap, FIRST_KEYMAP_WAIT};
+#[cfg(windows)]
+use crate::win::gpu::{Decoder, DisplayFrame, Gpu};
 
 /// Stream geometry one picture was configured under: stream size, view
 /// size, and the effective scale x1000.
@@ -115,7 +119,7 @@ pub enum Endpoint {
     Ssh(SshTarget),
 }
 
-/// A decoded frame for the GTK thread: a dmabuf from the GPU tier, or plain
+/// A decoded frame for the UI thread: a dmabuf from the GPU tier, or plain
 /// BGRA pixels from the CPU tier.
 pub enum Frame {
     Dmabuf(DisplayFrame),
@@ -201,6 +205,7 @@ enum VideoDecoder {
 /// Open the GPU for decoding, or `None` for the CPU tier. In `Gpu` mode a
 /// machine without Vulkan compute or a VA-API H.264 decoder falls back to
 /// the CPU.
+#[cfg(target_os = "linux")]
 fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
     if mode == VideoMode::Cpu {
         tracing::info!("using the CPU video pipeline as requested");
@@ -218,6 +223,29 @@ fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
         }
     }
 }
+
+/// The window's Direct3D 11 device, which Media Foundation decodes on. It
+/// exists only when the window could draw with it.
+#[cfg(windows)]
+fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
+    if mode == VideoMode::Cpu {
+        tracing::info!("using the CPU video pipeline as requested");
+        return None;
+    }
+    let gpu = Gpu::shared();
+    if gpu.is_none() {
+        tracing::info!("no Direct3D 11 device; using the CPU pipeline");
+    }
+    gpu
+}
+
+/// The chroma modes the GPU tier decodes. On Windows only 4:2:0: 4:4:4 is
+/// two encodes on the server, and decoding it on the GPU needs a recombine
+/// pass this tier does not have yet.
+#[cfg(target_os = "linux")]
+const GPU_CHROMA: &[ChromaMode] = &[ChromaMode::Dual420, ChromaMode::Single420];
+#[cfg(windows)]
+const GPU_CHROMA: &[ChromaMode] = &[ChromaMode::Single420];
 
 fn new_decoder(
     gpu: &Option<Arc<Gpu>>,
@@ -281,7 +309,7 @@ where
         // The CPU tier asks for one 4:2:0 stream so it decodes one stream,
         // not two; the recombine also costs CPU on this side.
         chroma: if gpu.is_some() {
-            vec![ChromaMode::Dual420, ChromaMode::Single420]
+            GPU_CHROMA.to_vec()
         } else {
             vec![ChromaMode::Single420]
         },
@@ -583,6 +611,8 @@ where
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
                 in_decoder.push_back(((width, height), view, scale_milli));
                 let t0 = std::time::Instant::now();
+                // The Windows GPU decoder already returns anyhow errors.
+                #[cfg_attr(windows, allow(clippy::useless_conversion))]
                 let decoded = match &mut decoder {
                     VideoDecoder::Gpu(d) => {
                         // A decoder made by a StreamConfig starts at zoom 1.

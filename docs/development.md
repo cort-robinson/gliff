@@ -24,6 +24,22 @@ without both, gliff uses the CPU tier. The compute shaders are committed as SPIR
 (`crates/gliff-vk/shaders/build.sh` rebuilds them with `glslc`), and the
 libva bindings as bindgen output (`crates/gliff-va/bindings/gen.sh`).
 
+On Windows only the client builds, from Git Bash or PowerShell, with
+Rust's MSVC toolchain and the Visual Studio C++ build tools (for
+OpenH264):
+
+```
+cargo build --release -p gliff
+```
+
+`scripts/check.sh` runs there too (from Git Bash) and limits clippy and
+the tests to the client. The pure parts of the Windows client (key
+codes, layouts, the fit, clipboard image conversion, the SPS rewrite)
+also build and run in the Linux tests, and on Linux the layout table is
+compiled against the local XKB data. `RUST_LOG=gliff::win=trace` logs
+each present's duration and the decoder's first-picture delay;
+`--video cpu` (or `GLIFF_VIDEO=cpu`) runs the OpenH264 and GDI path.
+
 Verify the machine first:
 
 ```

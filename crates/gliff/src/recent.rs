@@ -1,7 +1,8 @@
 //! The machines this client has connected to, in the order they were first
-//! connected, kept in `$XDG_CONFIG_HOME/gliff/config.toml` so the header can
-//! offer them again as tabs. It also keeps which of them were connected and
-//! which was shown, so a reopened window connects to them again.
+//! connected, kept in `$XDG_CONFIG_HOME/gliff/config.toml` (on Windows,
+//! `%APPDATA%\gliff\config.toml`) so the header can offer them again as
+//! tabs. It also keeps which of them were connected and which was shown,
+//! so a reopened window connects to them again.
 
 use std::path::{Path, PathBuf};
 
@@ -21,8 +22,19 @@ pub struct Config {
 
 impl Config {
     /// Where the client keeps its config: `~/.config/gliff/config.toml`.
+    #[cfg(target_os = "linux")]
     pub fn default_path() -> PathBuf {
         gtk4::glib::user_config_dir()
+            .join("gliff")
+            .join("config.toml")
+    }
+
+    /// Where the client keeps its config: `%APPDATA%\gliff\config.toml`.
+    #[cfg(windows)]
+    pub fn default_path() -> PathBuf {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
             .join("gliff")
             .join("config.toml")
     }
@@ -79,6 +91,7 @@ impl Config {
         self.machines.push(machine.to_string());
     }
 
+    #[cfg_attr(windows, allow(dead_code))] // the Windows window has no tabs
     pub fn forget(&mut self, machine: &str) {
         self.machines.retain(|m| m != machine);
         self.set_open(machine, false);
@@ -100,6 +113,7 @@ impl Config {
 
     /// Move `machine` to just before `target`, or just after it with
     /// `after`. False when either is not in the list, or they are the same.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn move_machine(&mut self, machine: &str, target: &str, after: bool) -> bool {
         if machine == target || !self.machines.iter().any(|m| m == target) {
             return false;
