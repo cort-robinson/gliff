@@ -930,13 +930,17 @@ impl App {
                 tracing::debug!(stats = %line);
                 self.set_stats(&line);
             }
-            Status::Cursor {
-                width,
-                height,
-                hot_x,
-                hot_y,
-                argb,
-            } => {
+            Status::Cursor(latest) => {
+                let Some(crate::net::CursorShape {
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    argb,
+                }) = latest.take()
+                else {
+                    return true;
+                };
                 let remote = has_visible_shape(&argb)
                     .then(|| gdi::cursor_from_bgra(width, height, hot_x, hot_y, &argb))
                     .flatten();
@@ -956,9 +960,13 @@ impl App {
                     cb.set_remote_offer(tx, serial, &mime_types, &files);
                 }
             }
-            Status::ClipboardRead { mime_type, reply } => {
+            Status::ClipboardRead {
+                mime_type,
+                generation,
+                reply,
+            } => {
                 if let Some(cb) = &self.clipboard {
-                    cb.read_local(&mime_type, reply);
+                    cb.read_local(&mime_type, generation, reply);
                 }
             }
             Status::ClipboardTransfer { id, progress } => {

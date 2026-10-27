@@ -31,8 +31,8 @@ use gliff_transport::clipboard::files::LocalFiles;
 use windows_sys::Win32::Foundation::{GlobalFree, HANDLE, HWND};
 use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    GetClipboardOwner, GetOpenClipboardWindow, IsClipboardFormatAvailable, OpenClipboard,
-    RegisterClipboardFormatW, SetClipboardData,
+    GetClipboardOwner, GetClipboardSequenceNumber, GetOpenClipboardWindow,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -126,16 +126,16 @@ impl Clipboard {
 
     /// The mime types to offer the server for the current local selection,
     /// or `None` when the change is our own proxy for the server's.
-    pub fn local_offer(&self) -> Option<Vec<String>> {
+    fn local_offer(&self) -> Option<(Vec<String>, u64)> {
         if self.owns() {
             return None;
         }
         let Some(_open) = Open::new(self.hwnd) else {
-            return Some(Vec::new());
+            return Some((Vec::new(), 0));
         };
         if self.is_private() {
             tracing::debug!("local selection is marked private; not offered");
-            return Some(Vec::new());
+            return Some((Vec::new(), 0));
         }
         let mut mimes = Vec::new();
         if Self::available(TEXT) {
@@ -144,23 +144,32 @@ impl Clipboard {
         if Self::available(self.png) || Self::available(DIB) {
             mimes.push(IMAGE_MIME.to_string());
         }
-        Some(forwardable_mimes(&mimes))
+        // SAFETY: this query takes no arguments; the clipboard remains open.
+        let generation = unsafe { GetClipboardSequenceNumber() } as u64;
+        Some((forwardable_mimes(&mimes), generation))
     }
 
     /// Report the local selection to a session's worker.
     pub fn offer_to(&self, tx: &UnboundedSender<ToWorker>) {
-        if let Some(mime_types) = self.local_offer() {
+        let _ = tx.send(ToWorker::RevokeLocal);
+        if let Some((mime_types, generation)) = self.local_offer() {
             let _ = tx.send(ToWorker::LocalOffer {
                 mime_types,
                 files: LocalFiles::default(),
+                generation,
             });
         }
     }
 
     /// Read `mime_type` from the local clipboard for the server, streaming
     /// it into `reply` from another thread; dropping `reply` ends the item.
-    pub fn read_local(&self, mime_type: &str, reply: mpsc::Sender<io::Result<Bytes>>) {
-        let data = self.read(mime_type);
+    pub fn read_local(
+        &self,
+        mime_type: &str,
+        generation: u64,
+        reply: mpsc::Sender<io::Result<Bytes>>,
+    ) {
+        let data = self.read(mime_type, generation);
         std::thread::spawn(move || match data {
             Ok(data) => {
                 for chunk in data.chunks(CHUNK) {
@@ -178,12 +187,16 @@ impl Clipboard {
         });
     }
 
-    fn read(&self, mime_type: &str) -> io::Result<Vec<u8>> {
+    fn read(&self, mime_type: &str, generation: u64) -> io::Result<Vec<u8>> {
         // Reading our own proxy would ask the server for its own item.
         if self.owns() {
             return Err(io::Error::other("clipboard holds the server's offer"));
         }
         let _open = Open::new(self.hwnd).ok_or_else(|| io::Error::other("clipboard is busy"))?;
+        // SAFETY: this query takes no arguments; the clipboard remains open.
+        if unsafe { GetClipboardSequenceNumber() } as u64 != generation {
+            return Err(io::Error::other("clipboard selection changed"));
+        }
         if self.is_private() {
             return Err(io::Error::other("clipboard selection is marked private"));
         }
