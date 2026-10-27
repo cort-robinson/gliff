@@ -701,7 +701,7 @@ where
                 let redrawn = match &mut decoder {
                     VideoDecoder::Gpu(d) => match zoom.sync_gpu(d.as_mut(), cfg.stream) {
                         None => None,
-                        Some(set) => match set.and_then(|_| d.redraw()) {
+                        Some(set) => match set.and_then(|_| d.redraw().map_err(|e| anyhow::anyhow!("{e}"))) {
                             Ok(frame) => {
                                 tracing::info!(zoom = d.zoom(), "decoder output zoom");
                                 frame.map(Frame::Dmabuf)

@@ -1,17 +1,10 @@
-//! gliff: a GTK4/libadwaita window that connects to a gliff server,
-//! decodes the video, shows it, and forwards keyboard and pointer input.
+//! The Linux client: a GTK4/libadwaita window that connects to a gliff
+//! server, decodes the video, shows it, and forwards keyboard and pointer
+//! input.
 //!
 //! Decode runs on a worker thread (see `net`); this file is the UI. Decoded
 //! frames arrive as dmabufs, which GTK imports as textures, so the UI has no
 //! GPU code of its own; its one `unsafe` block hands GTK a dmabuf fd.
-
-mod clipboard;
-mod clipboard_ui;
-mod keymap;
-mod net;
-mod paintable;
-mod recent;
-mod theme;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -30,10 +23,13 @@ use gtk::gdk;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
-use net::Frame;
-use net::{Endpoint, Picture, Status, Worker};
-use recent::Config;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+
+use crate::cursor::has_visible_shape;
+use crate::net::Frame;
+use crate::net::{Endpoint, Picture, Status, Worker};
+use crate::recent::Config;
+use crate::{clipboard, clipboard_ui, keymap, paintable, theme};
 
 /// A message plus optional trailing payload, sent from the UI to the worker.
 type OutSender = UnboundedSender<clipboard::ToWorker>;
@@ -222,10 +218,7 @@ impl Session {
     }
 }
 
-fn main() -> glib::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+pub(crate) fn main() -> glib::ExitCode {
     let cli = Cli::parse();
     // GTK uses the program name as the Wayland app ID.
     glib::set_prgname(Some(APP_NAME));
@@ -1523,16 +1516,6 @@ fn remote_cursor(image: CursorImage) -> Option<gdk::Cursor> {
         width as usize * 4,
     );
     Some(gdk::Cursor::from_texture(&texture, hot_x, hot_y, None))
-}
-
-fn has_visible_shape(argb: &[u8]) -> bool {
-    let mut pixels = argb.chunks_exact(4);
-    let Some(first) = pixels.next() else {
-        return false;
-    };
-    let opaque = first[3] != 0 || pixels.clone().any(|p| p[3] != 0);
-    let uniform = pixels.all(|p| p == first);
-    opaque && !uniform
 }
 
 /// Map a widget-space point to the remote output's logical coordinates:

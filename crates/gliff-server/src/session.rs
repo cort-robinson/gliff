@@ -185,13 +185,15 @@ where
     let capturer = report_setup(
         &mut writer,
         start_capture(
-            &cfg.target,
-            &output.name,
-            &cfg.render_node,
-            cfg.capture,
-            allow_shm,
-            output.is_headless(),
-            import_modifiers,
+            capture_config(
+                &cfg.target,
+                &output.name,
+                &cfg.render_node,
+                cfg.capture,
+                allow_shm,
+                output.is_headless(),
+                import_modifiers,
+            ),
             cap_tx,
         ),
     )
@@ -1848,25 +1850,7 @@ fn capture_config(
     cc
 }
 
-fn start_capture(
-    target: &Target,
-    output: &str,
-    render_node: &std::path::Path,
-    capture: CaptureMode,
-    allow_shm: bool,
-    headless: bool,
-    import_modifiers: Option<Vec<(u32, Vec<u64>)>>,
-    tx: UnboundedSender<Incoming>,
-) -> Result<Capturer> {
-    let cc = capture_config(
-        target,
-        output,
-        render_node,
-        capture,
-        allow_shm,
-        headless,
-        import_modifiers,
-    );
+fn start_capture(cc: CaptureConfig, tx: UnboundedSender<Incoming>) -> Result<Capturer> {
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
             CaptureEvent::Frame(frame) => Incoming::Frame(frame),
